@@ -75,6 +75,7 @@ the current support commitment unless documented in
 | Model family | Task | Base checkpoint | Distilled variant (few-step) | Status |
 |---|---|---|---|---|
 | **SD3 / SD3.5** | Text-to-image | `stabilityai/stable-diffusion-3-medium` | SD3.5-medium-turbo | Supported |
+| **[DreamLite-mobile](docs/dreamlite.md)** | Text-to-image / single-image editing | Diffusers checkpoint or complete Q4_1/FP16 GGUF | Native 4-step model | CPU / CUDA |
 | **FLUX.1** | Text-to-image | `black-forest-labs/FLUX.1-dev` | FLUX.1-schnell | Supported |
 | **FLUX.1-Kontext** | Image editing / reference-guided | `black-forest-labs/FLUX.1-Kontext-dev` | Kontext Lightning | Supported |
 | **FLUX.2 [klein] 4B** | Text-to-image / image editing | `black-forest-labs/FLUX.2-klein-4B` | Native FLUX.2 [klein] 4B checkpoint | Supported |

@@ -193,6 +193,7 @@ const char* ed_version_name(SDVersion version) {
         case VERSION_WAN2: return "wan2";
         case VERSION_WAN2_2_I2V: return "wan2.2-i2v";
         case VERSION_WAN2_2_TI2V: return "wan2.2-ti2v";
+        case VERSION_DREAMLITE_MOBILE: return "dreamlite-mobile";
         case VERSION_QWEN_IMAGE: return "qwen-image";
         case VERSION_QWEN_IMAGE_EDIT: return "qwen-image-edit";
         case VERSION_MINIMAX_H3: return "minimax-h3";
@@ -345,6 +346,14 @@ static SDVersion infer_transformer_file_version(const std::string& file_path) {
     if (contains(lower_normalized, "kontext")) {
         return VERSION_FLUX_KONTEXT;
     }
+    if (contains(normalized, "/unet/")) {
+        nlohmann::json config;
+        std::string error;
+        if (read_json_file(path_join(parent_path(file_path), "config.json"), &config, &error) &&
+            config.value("_class_name", "") == "DreamLiteUNetModel") {
+            return VERSION_DREAMLITE_MOBILE;
+        }
+    }
     if (!contains(normalized, "/transformer/") &&
         !contains(normalized, "/transformer_ref/")) {
         return VERSION_COUNT;
@@ -458,6 +467,9 @@ static SDVersion infer_diffusers_version(const std::string& dir_path) {
     nlohmann::json index;
     const std::string model_index_path = path_join(dir_path, "model_index.json");
     if (file_exists(model_index_path) && read_json_file(model_index_path, &index, &error)) {
+        if (index.value("_class_name", "") == "DreamLiteMobilePipeline") {
+            return VERSION_DREAMLITE_MOBILE;
+        }
         if (index.contains("_class_name") && index["_class_name"].is_string()) {
             const std::string klass = index["_class_name"].get<std::string>();
             if (contains(klass, "Wan")) {
@@ -529,6 +541,11 @@ static SDVersion infer_diffusers_version(const std::string& dir_path) {
         return VERSION_SDXL;
     }
     if (is_directory(path_join(dir_path, "unet"))) {
+        nlohmann::json config;
+        if (read_json_file(path_join(dir_path, "unet/config.json"), &config, &error) &&
+            config.value("_class_name", "") == "DreamLiteUNetModel") {
+            return VERSION_DREAMLITE_MOBILE;
+        }
         return VERSION_SD1;
     }
 
@@ -1436,6 +1453,9 @@ bool ModelLoader::init_from_diffusers_directory(const std::string& dir_path, con
         }
 
         std::string component_prefix = is_flux1_family_version(version_) ? component.flux_prefix : component.sd_prefix;
+        if (version_ == VERSION_DREAMLITE_MOBILE && std::strcmp(component.dir, "text_encoder") == 0) {
+            component_prefix = "text_encoders.llm.";
+        }
         if (ed_version_is_wan(version_)) {
             if (std::strcmp(component.dir, "text_encoder") == 0) {
                 component_prefix = "text_encoders.t5xxl.transformer.";
@@ -1556,6 +1576,11 @@ bool ModelLoader::init_from_diffusers_directory(const std::string& dir_path, con
 }
 
 SDVersion ModelLoader::get_ld_version() {
+    for (const auto& item : tensor_storage_map_) {
+        if (ends_with(item.first, "down_blocks.0.resnets.0.conv1.depthwise.weight")) {
+            return VERSION_DREAMLITE_MOBILE;
+        }
+    }
     bool has_flux_double = false;
     bool has_flux_single = false;
     bool has_transformer_blocks = false;

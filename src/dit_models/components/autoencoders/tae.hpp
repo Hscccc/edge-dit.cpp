@@ -2,6 +2,7 @@
 #define __TAE_HPP__
 
 #include "backend/ggml/ggml_extend.hpp"
+#include "dit_models/components/autoencoders/vae.hpp"
 
 /*
     ===================================    TinyAutoEncoder  ===================================
@@ -68,7 +69,7 @@ public:
             x = skip->forward(ctx, x);
         }
 
-        h = ggml_add(ctx->ggml_ctx, h, x);
+        h = bf16_boundary(ctx, ggml_add(ctx->ggml_ctx, h, x));
         h = ggml_relu_inplace(ctx->ggml_ctx, h);
         return h;
     }
@@ -159,9 +160,9 @@ public:
         // z: [n, z_channels, h, w]
         // return: [n, out_channels, h*8, w*8]
 
-        auto h = ggml_ext_scale(ctx->ggml_ctx, z, 1.0f / 3.0f);
-        h      = ggml_tanh_inplace(ctx->ggml_ctx, h);
-        h      = ggml_ext_scale(ctx->ggml_ctx, h, 3.0f);
+        auto h = bf16_boundary(ctx, ggml_ext_scale(ctx->ggml_ctx, z, 1.0f / 3.0f));
+        h      = bf16_boundary(ctx, ggml_tanh_inplace(ctx->ggml_ctx, h));
+        h      = bf16_boundary(ctx, ggml_ext_scale(ctx->ggml_ctx, h, 3.0f));
 
         for (int i = 0; i < num_blocks * 3 + 10; i++) {
             if (blocks.find(std::to_string(i)) == blocks.end()) {
@@ -258,7 +259,7 @@ public:
     }
 };
 
-ggml_tensor* patchify(ggml_context* ctx,
+inline ggml_tensor* patchify(ggml_context* ctx,
                       ggml_tensor* x,
                       int64_t patch_size,
                       int64_t b = 1) {
@@ -287,7 +288,7 @@ ggml_tensor* patchify(ggml_context* ctx,
     return x;
 }
 
-ggml_tensor* unpatchify(ggml_context* ctx,
+inline ggml_tensor* unpatchify(ggml_context* ctx,
                         ggml_tensor* x,
                         int64_t patch_size,
                         int64_t b = 1) {
@@ -549,6 +550,10 @@ struct TinyImageAutoEncoder : public VAE {
           taesd(decoder_only, version),
           VAE(version, backend, offload_params_to_cpu) {
         scale_input = false;
+        if (version == VERSION_DREAMLITE_MOBILE) {
+            set_bf16_compute(true);
+            taesd.set_bf16_weights(true);
+        }
         taesd.init(params_ctx, tensor_storage_map, prefix);
     }
 
@@ -581,8 +586,23 @@ struct TinyImageAutoEncoder : public VAE {
         ggml_cgraph* gf  = ggml_new_graph(compute_ctx);
         ggml_tensor* z   = make_input(z_tensor);
         auto runner_ctx  = get_context();
+        if (runner_ctx.bf16_compute && !decode_graph) {
+            // Python preprocess casts [-1,1] pixels to BF16, then EncoderTiny
+            // evaluates (x + 1) / 2 in BF16 before its first convolution.
+            z = ggml_scale_bias(compute_ctx, z, 2.f, -1.f);
+            z = bf16_boundary(&runner_ctx, z);
+            z = bf16_boundary(&runner_ctx, ggml_scale_bias(compute_ctx, z, 1.f, 1.f));
+            z = ggml_scale(compute_ctx, z, 0.5f);
+        }
+        z = bf16_boundary(&runner_ctx, z);
         runner_ctx.conv2d_auto_direct_enabled = decode_graph && should_use_cuda_auto_conv2d();
         ggml_tensor* out = decode_graph ? taesd.decode(&runner_ctx, z) : taesd.encode(&runner_ctx, z);
+        if (runner_ctx.bf16_compute && decode_graph) {
+            // DecoderTiny returns BF16 (2*x-1); image postprocessing is F32.
+            out = bf16_boundary(&runner_ctx, ggml_scale(compute_ctx, out, 2.f));
+            out = bf16_boundary(&runner_ctx, ggml_scale_bias(compute_ctx, out, 1.f, -1.f));
+            out = ggml_scale_bias(compute_ctx, out, 0.5f, 0.5f);
+        }
         ggml_build_forward_expand(gf, out);
         return gf;
     }

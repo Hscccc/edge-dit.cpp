@@ -1,4 +1,5 @@
 #include "dit_models/pipelines/dit_pipeline.hpp"
+#include "dit_models/pipelines/dreamlite_pipeline.hpp"
 
 #include "dit_models/pipelines/flux_kontext_pipeline.hpp"
 #include "dit_models/pipelines/flux_pipeline.hpp"
@@ -14,6 +15,9 @@ namespace edgedit {
 
 std::unique_ptr<DiTPipeline> create_dit_pipeline(SDVersion version,
                                                  std::string* error) {
+    if (version == VERSION_DREAMLITE_MOBILE) {
+        return std::make_unique<DreamLitePipeline>();
+    }
     if (version == VERSION_FLUX_KONTEXT) {
         return std::make_unique<FluxKontextPipeline>(version);
     }

@@ -78,8 +78,8 @@ namespace LLM {
         return ggml_cast(ctx, ggml_cast(ctx, x, GGML_TYPE_BF16), GGML_TYPE_F32);
     }
 
-    static inline ggml_tensor* qwen_align_maybe_bf16_llm_roundtrip(ggml_context* ctx, ggml_tensor* x) {
-        return qwen_align_bf16_llm_internals_enabled() ? qwen_align_bf16_roundtrip_to_f32(ctx, x) : x;
+    static inline ggml_tensor* qwen_align_maybe_bf16_llm_roundtrip(GGMLRunnerContext* ctx, ggml_tensor* x) {
+        return (ctx->bf16_compute || qwen_align_bf16_llm_internals_enabled()) ? qwen_align_bf16_roundtrip_to_f32(ctx->ggml_ctx, x) : x;
     }
 
     static inline void qwen_align_log_int_samples(const char* name,
@@ -359,7 +359,7 @@ namespace LLM {
             };
 
             auto h = gate_proj->forward(ctx, x);
-            h      = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, h);
+            h      = qwen_align_maybe_bf16_llm_roundtrip(ctx, h);
             if (is_debug_target(".mlp.gate")) {
                 return h;
             }
@@ -368,22 +368,22 @@ namespace LLM {
             } else {
                 h = ggml_silu_inplace(ctx->ggml_ctx, h);
             }
-            h      = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, h);
+            h      = qwen_align_maybe_bf16_llm_roundtrip(ctx, h);
             if (is_debug_target(".mlp.act")) {
                 return h;
             }
             auto u = up_proj->forward(ctx, x);
-            u      = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, u);
+            u      = qwen_align_maybe_bf16_llm_roundtrip(ctx, u);
             if (is_debug_target(".mlp.up")) {
                 return u;
             }
             h      = ggml_mul_inplace(ctx->ggml_ctx, h, u);
-            h      = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, h);
+            h      = qwen_align_maybe_bf16_llm_roundtrip(ctx, h);
             if (is_debug_target(".mlp.mul")) {
                 return h;
             }
             h      = down_proj->forward(ctx, h);
-            h      = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, h);
+            h      = qwen_align_maybe_bf16_llm_roundtrip(ctx, h);
             if (is_debug_target(".mlp.out")) {
                 return h;
             }
@@ -511,7 +511,7 @@ namespace LLM {
 
                 const int64_t patch_dim   = patch_size * patch_size * temporal_patch_size * in_channels;
                 const int64_t patch_count = ggml_nelements(x) / patch_dim;
-                if (qwen_align_patch_embed_cudnn_conv3d_enabled() &&
+                if (!ctx->bf16_compute && qwen_align_patch_embed_cudnn_conv3d_enabled() &&
                     sd_backend_is(ctx->backend, "CUDA") &&
                     patch_count > 0 &&
                     ggml_nelements(x) == patch_dim * patch_count &&
@@ -548,7 +548,18 @@ namespace LLM {
                                     w,
                                     patch_dim,
                                     embed_dim);
-                x = ggml_ext_linear(ctx->ggml_ctx, x, w, b);
+                // Matmul returns F32. CPU binary ops require the patch bias to
+                // have the same type, even when the checkpoint stores BF16.
+                if (b != nullptr && b->type != GGML_TYPE_F32) {
+                    b = ggml_cast(ctx->ggml_ctx, b, GGML_TYPE_F32);
+                }
+                const bool cuda_bf16_bias = ctx->bf16_compute && sd_backend_is(ctx->backend, "CUDA") && b != nullptr;
+                x = ggml_ext_linear(ctx->ggml_ctx, x, w, cuda_bf16_bias ? nullptr : b, ctx->bf16_compute);
+                if (cuda_bf16_bias) {
+                    // Match PyTorch CUDA Conv3d: convolution BF16 output,
+                    // followed by a separate BF16 bias addition.
+                    x = ggml_add(ctx->ggml_ctx, bf16_boundary(ctx, x), b);
+                }
                 if (qwen_align_diffusers_vision_dtype_enabled() &&
                     (w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_BF16) &&
                     x->type != w->type) {
@@ -557,7 +568,7 @@ namespace LLM {
             }
 
             x = ggml_reshape_2d(ctx->ggml_ctx, x, embed_dim, ggml_nelements(x) / embed_dim);
-            return x;
+            return bf16_boundary(ctx, x);
         }
     };
 
@@ -630,7 +641,7 @@ namespace LLM {
                 return x;
             }
             x = ln_q->forward(ctx, x);
-            x = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, x);
+            x = qwen_align_maybe_bf16_llm_roundtrip(ctx, x);
             if (is_debug_target(".ln_q")) {
                 return x;
             }
@@ -639,17 +650,17 @@ namespace LLM {
                 return x;
             }
             x = mlp_0->forward(ctx, x);
-            x = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, x);
+            x = qwen_align_maybe_bf16_llm_roundtrip(ctx, x);
             if (is_debug_target(".mlp.0")) {
                 return x;
             }
             x = ggml_gelu_erf(ctx->ggml_ctx, x);
-            x = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, x);
+            x = qwen_align_maybe_bf16_llm_roundtrip(ctx, x);
             if (is_debug_target(".gelu")) {
                 return x;
             }
             x = mlp_2->forward(ctx, x);
-            x = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, x);
+            x = qwen_align_maybe_bf16_llm_roundtrip(ctx, x);
             if (is_debug_target(".out")) {
                 return x;
             }
@@ -704,7 +715,16 @@ namespace LLM {
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
             if (arch_ == LLMVisionArch::QWEN3_VL) {
                 x = std::dynamic_pointer_cast<Linear>(blocks["linear_fc1"])->forward(ctx, x);
-                x = ggml_ext_gelu(ctx->ggml_ctx, x);
+                if (ctx->bf16_compute) {
+                    // ggml's CPU GELU uses an FP16 lookup table. The Python
+                    // gelu_pytorch_tanh path computes in F32 and rounds to BF16.
+                    auto cubic = ggml_mul(ctx->ggml_ctx, ggml_sqr(ctx->ggml_ctx, x), x);
+                    auto inner = ggml_add(ctx->ggml_ctx, x, ggml_scale(ctx->ggml_ctx, cubic, 0.044715f));
+                    auto tanh = ggml_tanh(ctx->ggml_ctx, ggml_scale(ctx->ggml_ctx, inner, 0.7978845608028654f));
+                    x = bf16_boundary(ctx, ggml_mul(ctx->ggml_ctx, x, ggml_scale_bias(ctx->ggml_ctx, tanh, 0.5f, 0.5f)));
+                } else {
+                    x = ggml_ext_gelu(ctx->ggml_ctx, x);
+                }
                 return std::dynamic_pointer_cast<Linear>(blocks["linear_fc2"])->forward(ctx, x);
             }
             auto gate_proj = std::dynamic_pointer_cast<Linear>(blocks["gate_proj"]);
@@ -906,7 +926,7 @@ namespace LLM {
             } else {
                 auto qkv_proj = std::dynamic_pointer_cast<Linear>(blocks["qkv"]);
                 auto qkv      = qkv_proj->forward(ctx, x);
-                qkv           = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, qkv);
+                qkv           = qwen_align_maybe_bf16_llm_roundtrip(ctx, qkv);
                 if (is_debug_target(".attn.qkv")) {
                     return qkv;
                 }
@@ -935,20 +955,20 @@ namespace LLM {
             const ggml_type attention_output_type = v->type;
             x = window_sdpa_attention(ctx, q, k, v, pe, cu_window_seqlens);
             if (x == nullptr) {
-                x = Rope::attention(ctx, q, k, v, pe, mask, 1.f, false);  // [N, n_token, hidden_size]
+                x = Rope::attention(ctx, q, k, v, pe, mask, 1.f, false, true, false, ctx->bf16_compute);  // [N, n_token, hidden_size]
             }
             if (qwen_align_diffusers_vision_dtype_enabled() &&
                 (attention_output_type == GGML_TYPE_F16 || attention_output_type == GGML_TYPE_BF16) &&
                 x->type != attention_output_type) {
                 x = ggml_cast(ctx->ggml_ctx, x, attention_output_type);
             }
-            x = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, x);
+            x = qwen_align_maybe_bf16_llm_roundtrip(ctx, x);
             if (is_debug_target(".attn.preproj")) {
                 return x;
             }
 
             x = proj->forward(ctx, x);  // [N, n_token, hidden_size]
-            x = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, x);
+            x = qwen_align_maybe_bf16_llm_roundtrip(ctx, x);
             if (is_debug_target(".attn.out")) {
                 return x;
             }
@@ -1014,7 +1034,7 @@ namespace LLM {
                 return x;
             }
             x             = forward_norm(ctx, "norm1", x);
-            x             = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, x);
+            x             = qwen_align_maybe_bf16_llm_roundtrip(ctx, x);
             if (is_debug_target(".norm1")) {
                 return x;
             }
@@ -1023,14 +1043,14 @@ namespace LLM {
                 return x;
             }
             x             = ggml_add_inplace(ctx->ggml_ctx, x, residual);
-            x             = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, x);
+            x             = qwen_align_maybe_bf16_llm_roundtrip(ctx, x);
             if (is_debug_target(".after_attn")) {
                 return x;
             }
 
             residual = x;
             x        = forward_norm(ctx, "norm2", x);
-            x        = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, x);
+            x        = qwen_align_maybe_bf16_llm_roundtrip(ctx, x);
             if (is_debug_target(".norm2")) {
                 return x;
             }
@@ -1043,7 +1063,7 @@ namespace LLM {
                 return x;
             }
             x        = ggml_add_inplace(ctx->ggml_ctx, x, residual);
-            x        = qwen_align_maybe_bf16_llm_roundtrip(ctx->ggml_ctx, x);
+            x        = qwen_align_maybe_bf16_llm_roundtrip(ctx, x);
             if (is_debug_target(".after_mlp")) {
                 return x;
             }
@@ -1119,9 +1139,14 @@ namespace LLM {
             auto merger      = std::dynamic_pointer_cast<PatchMerger>(blocks["merger"]);
 
             auto x = patch_embed->forward(ctx, pixel_values);
+            // CPU elementwise scratch is F32; reference mode restores BF16
+            // values at operation boundaries.
+            if (arch_ == LLMVisionArch::QWEN3_VL && x->type != GGML_TYPE_F32) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
+            }
             sd::ggml_graph_cut::mark_graph_cut(x, "llm.vision.prelude", "x");
             if (pos_embeds != nullptr) {
-                x = ggml_add(ctx->ggml_ctx, x, pos_embeds);
+                x = bf16_boundary(ctx, ggml_add(ctx->ggml_ctx, x, bf16_boundary(ctx, pos_embeds)));
             }
             if (debug_target == "patch_embed") {
                 return {x};
@@ -1360,8 +1385,35 @@ namespace LLM {
                                   rope_theta, 1.f / rope_scale, 0.f, 1.f, 32.f, 1.f);
             } else if (arch == LLMArch::QWEN3_VL) {
                 int sections[4] = {24, 20, 20, 0};
-                q = ggml_rope_multi(ctx->ggml_ctx, q, input_pos, nullptr, head_dim, sections, GGML_ROPE_TYPE_IMROPE, 262144, 5000000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
-                k = ggml_rope_multi(ctx->ggml_ctx, k, input_pos, nullptr, head_dim, sections, GGML_ROPE_TYPE_IMROPE, 262144, 5000000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
+                if (ctx->bf16_compute) {
+                    // Qwen text (unlike vision) casts cos/sin to BF16 before
+                    // rotating, and rounds each product before the sum. A
+                    // single F32 fused RoPE followed by a cast misses these steps.
+                    auto gc = ctx->ggml_ctx;
+                    const auto half = head_dim / 2;
+                    auto basis = ggml_concat(gc,
+                        ggml_ext_full(gc, 1.f, half, 1, n_token, N),
+                        ggml_ext_full(gc, 0.f, half, 1, n_token, N), 0);
+                    auto cs = bf16_boundary(ctx, ggml_rope_multi(gc, basis, input_pos, nullptr,
+                        head_dim, sections, GGML_ROPE_TYPE_IMROPE, 262144, 5000000.f, 1.f, 0.f, 1.f, 32.f, 1.f));
+                    auto cosine = ggml_ext_slice(gc, cs, 0, 0, half);
+                    auto sine = ggml_ext_slice(gc, cs, 0, half, head_dim);
+                    auto rotate = [&](ggml_tensor* value) {
+                        auto first = ggml_ext_slice(gc, value, 0, 0, half);
+                        auto second = ggml_ext_slice(gc, value, 0, half, head_dim);
+                        auto a = bf16_boundary(ctx, ggml_mul(gc, first, cosine));
+                        auto b = bf16_boundary(ctx, ggml_mul(gc, second, sine));
+                        auto c = bf16_boundary(ctx, ggml_mul(gc, second, cosine));
+                        auto d = bf16_boundary(ctx, ggml_mul(gc, first, sine));
+                        return ggml_concat(gc, bf16_boundary(ctx, ggml_sub(gc, a, b)),
+                                              bf16_boundary(ctx, ggml_add(gc, c, d)), 0);
+                    };
+                    q = rotate(q);
+                    k = rotate(k);
+                } else {
+                    q = ggml_rope_multi(ctx->ggml_ctx, q, input_pos, nullptr, head_dim, sections, GGML_ROPE_TYPE_IMROPE, 262144, 5000000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
+                    k = ggml_rope_multi(ctx->ggml_ctx, k, input_pos, nullptr, head_dim, sections, GGML_ROPE_TYPE_IMROPE, 262144, 5000000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
+                }
             } else {
                 int sections[4] = {16, 24, 24, 0};
                 q               = ggml_rope_multi(ctx->ggml_ctx, q, input_pos, nullptr, head_dim, sections, GGML_ROPE_TYPE_MROPE, 128000, 1000000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
@@ -1377,6 +1429,8 @@ namespace LLM {
                     k = ggml_cast(ctx->ggml_ctx, k, k_rope_output_type);
                 }
             }
+            q = bf16_boundary(ctx, q);
+            k = bf16_boundary(ctx, k);
             if (is_debug_target(".attn.q_rope")) {
                 return ggml_cont(ctx->ggml_ctx, q);
             }
@@ -1529,7 +1583,7 @@ namespace LLM {
             if (post_attention_norm != nullptr) {
                 x = post_attention_norm->forward(ctx, x);
             }
-            x = ggml_add_inplace(ctx->ggml_ctx, x, residual);
+            x = bf16_boundary(ctx, ggml_add_inplace(ctx->ggml_ctx, x, residual));
             if (is_debug_target(".after_attn")) {
                 return x;
             }
@@ -1546,7 +1600,7 @@ namespace LLM {
             if (post_ffw_norm != nullptr) {
                 x = post_ffw_norm->forward(ctx, x);
             }
-            x = ggml_add_inplace(ctx->ggml_ctx, x, residual);
+            x = bf16_boundary(ctx, ggml_add_inplace(ctx->ggml_ctx, x, residual));
             if (is_debug_target(".after_mlp")) {
                 return x;
             }
@@ -1581,7 +1635,7 @@ namespace LLM {
                     output = output == nullptr ? text_embed : ggml_concat(ctx->ggml_ctx, output, text_embed, 1);
                 }
                 auto visual_embed = ggml_ext_slice(ctx->ggml_ctx, raw_x, 1, index, index + image_embed->ne[1]);
-                visual_embed = ggml_add(ctx->ggml_ctx, visual_embed, image_embed);
+                visual_embed = bf16_boundary(ctx, ggml_add(ctx->ggml_ctx, visual_embed, image_embed));
                 output = output == nullptr ? visual_embed : ggml_concat(ctx->ggml_ctx, output, visual_embed, 1);
                 token_start = index + image_embed->ne[1];
             }
@@ -1829,7 +1883,8 @@ namespace LLM {
                   bool offload_params_to_cpu,
                   const String2TensorStorage& tensor_storage_map,
                   const std::string prefix,
-                  bool enable_vision_ = false)
+                  bool enable_vision_ = false,
+                  bool bf16_reference = false)
             : GGMLRunner(backend, offload_params_to_cpu), enable_vision(enable_vision_) {
             params.arch = arch;
             if (arch == LLMArch::MISTRAL_SMALL_3_2 || arch == LLMArch::MINISTRAL_3_3B) {
@@ -1958,6 +2013,8 @@ namespace LLM {
                 }
             }
             model = LLM(params, enable_vision, llama_cpp_style);
+            set_bf16_compute(bf16_reference);
+            model.set_bf16_weights(bf16_reference);
             model.init(params_ctx, tensor_storage_map, prefix);
         }
 
@@ -2436,8 +2493,11 @@ namespace LLM {
                 embed = ggml_reshape_2d(compute_ctx, embed, embed->ne[0], embed->ne[1] * embed->ne[2]);
                 auto weight_tensor = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F32, 1, static_cast<int64_t>(pos_embed_weight_data[index].size()));
                 set_backend_tensor_data(weight_tensor, pos_embed_weight_data[index].data());
-                embed = ggml_mul(compute_ctx, embed, weight_tensor);
-                result = result == nullptr ? embed : ggml_add(compute_ctx, result, embed);
+                // Python casts interpolation weights to the embedding dtype,
+                // then rounds each product and each left-associative sum.
+                weight_tensor = bf16_boundary(runner_ctx, weight_tensor);
+                embed = bf16_boundary(runner_ctx, ggml_mul(compute_ctx, embed, weight_tensor));
+                result = result == nullptr ? embed : bf16_boundary(runner_ctx, ggml_add(compute_ctx, result, embed));
             }
             return result;
         }
@@ -2814,8 +2874,9 @@ namespace LLM {
                     bool offload_params_to_cpu,
                     const String2TensorStorage& tensor_storage_map = {},
                     const std::string prefix                       = "",
-                    bool enable_vision                             = false)
-            : model(arch, backend, offload_params_to_cpu, tensor_storage_map, prefix, enable_vision) {
+                    bool enable_vision                             = false,
+                    bool bf16_reference                            = false)
+            : model(arch, backend, offload_params_to_cpu, tensor_storage_map, prefix, enable_vision, bf16_reference) {
             if (arch == LLMArch::MISTRAL_SMALL_3_2 || arch == LLMArch::MINISTRAL_3_3B) {
                 tokenizer = std::make_shared<MistralTokenizer>();
             } else {

@@ -988,7 +988,7 @@ std::string convert_diffusers_qwen_image_vae_to_wan(std::string name) {
 }
 
 std::string convert_first_stage_model_name(std::string name, std::string prefix, SDVersion version) {
-    if (ed_version_is_minimax_h3(version) || ed_version_is_ltxav(version)) {
+    if (ed_version_is_minimax_h3(version) || ed_version_is_ltxav(version) || version == VERSION_DREAMLITE_MOBILE) {
         return name;
     }
     if (ed_version_is_qwen_image(version) || ed_version_is_qwen_image_edit(version) || ed_version_is_wan(version)) {
@@ -1314,7 +1314,7 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
 
     replace_with_prefix_map(name, prefix_map);
 
-    if (ed_version_is_minimax_h3(version)) {
+    if (ed_version_is_minimax_h3(version) || version == VERSION_DREAMLITE_MOBILE) {
         const std::string raw_language_prefix = "model.language_model.";
         if (starts_with(name, raw_language_prefix)) {
             name = "text_encoders.llm.model." + name.substr(raw_language_prefix.size());

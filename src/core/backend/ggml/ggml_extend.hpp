@@ -2197,6 +2197,8 @@ struct WeightAdapter {
 };
 
 struct GGMLRunnerContext {
+    // Opt-in BF16 numerical boundaries, with F32 scratch for unsupported ops.
+    bool bf16_compute = false;
     ggml_backend_t backend                        = nullptr;
     ggml_context* ggml_ctx                        = nullptr;
     edgedit::parallel::ProcessGroup* process_group = nullptr;
@@ -2222,6 +2224,11 @@ struct GGMLRunnerContext {
     size_t max_graph_vram_bytes = 0;
     std::function<void(ggml_tensor*, const void*)> bind_backend_tensor_data;
 };
+
+inline ggml_tensor* bf16_boundary(GGMLRunnerContext* ctx, ggml_tensor* x) {
+    if (!ctx->bf16_compute) return x;
+    return ggml_cast(ctx->ggml_ctx, ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_BF16), GGML_TYPE_F32);
+}
 
 // Model-facing tap primitive. Called by a model's forward() at a structural
 // landmark (model input, block output k, model output). Conditional: a no-op
@@ -2755,6 +2762,7 @@ protected:
     std::vector<RuntimeConstCacheEntry> runtime_const_cache_;
     const std::string final_result_name = "ggml_runner_final_result_tensor";
 
+    bool bf16_compute         = false;
     bool flash_attn_enabled    = false;
     bool conv2d_direct_enabled = false;
     bool circular_x_enabled    = false;
@@ -7021,6 +7029,7 @@ public:
 
     virtual GGMLRunnerContext get_context() {
         GGMLRunnerContext runner_ctx;
+        runner_ctx.bf16_compute          = bf16_compute;
         runner_ctx.ggml_ctx              = compute_ctx;
         runner_ctx.backend               = runtime_backend;
         runner_ctx.process_group         = process_group_.get();
@@ -7493,6 +7502,8 @@ public:
                                 nullptr,
                                 runner_profile_enabled() ? &runner_profile : nullptr);
     }
+    void set_bf16_compute(bool enabled) { bf16_compute = enabled; }
+
     void set_flash_attention_enabled(bool enabled) {
         flash_attn_enabled = enabled;
     }
@@ -7549,6 +7560,7 @@ protected:
     typedef std::unordered_map<std::string, std::shared_ptr<GGMLBlock>> GGMLBlockMap;
     GGMLBlockMap blocks;
     ParameterMap params;
+    bool bf16_weights = false;
 
     ggml_type get_type(const std::string& name, const String2TensorStorage& tensor_storage_map, ggml_type default_type) {
         ggml_type wtype = default_type;
@@ -7560,6 +7572,9 @@ protected:
             } else {
                 wtype = tensor_storage.type;
             }
+        }
+        if (bf16_weights && (wtype == GGML_TYPE_F32 || wtype == GGML_TYPE_F16 || wtype == GGML_TYPE_BF16)) {
+            wtype = GGML_TYPE_BF16;
         }
         return wtype;
     }
@@ -7574,6 +7589,11 @@ protected:
     virtual void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") {}
 
 public:
+    void set_bf16_weights(bool enabled) {
+        bf16_weights = enabled;
+        for (auto& item : blocks) item.second->set_bf16_weights(enabled);
+    }
+
     void init(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, std::string prefix = "") {
         if (prefix.size() > 0) {
             prefix = prefix + ".";
@@ -7727,13 +7747,15 @@ public:
             return ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx, ctx->backend, x, w, b, prefix, forward_params);
         }
         const std::string matmul_name = prefix + "weight";
-        x = ggml_ext_linear(ctx->ggml_ctx, x, w, b, force_prec_f32, effective_scale, matmul_name.c_str());
+        x = bf16_boundary(ctx, x);
+        if (ctx->bf16_compute && b && b->type != GGML_TYPE_F32) b = ggml_cast(ctx->ggml_ctx, b, GGML_TYPE_F32);
+        x = ggml_ext_linear(ctx->ggml_ctx, x, w, b, force_prec_f32 || ctx->bf16_compute, effective_scale, matmul_name.c_str());
         if (cast_output_to_input_type &&
             (output_type == GGML_TYPE_F16 || output_type == GGML_TYPE_BF16) &&
             x->type != output_type) {
             x = ggml_cast(ctx->ggml_ctx, x, output_type);
         }
-        return x;
+        return bf16_boundary(ctx, x);
     }
 
     ggml_tensor* forward_output_slice(GGMLRunnerContext* ctx,
@@ -7912,7 +7934,7 @@ public:
         embedding      = ggml_reshape_3d(ctx->ggml_ctx, embedding, embedding->ne[0], embedding->ne[1] / n, n);
 
         // [N, n_token, embedding_dim]
-        return embedding;
+        return bf16_boundary(ctx, embedding);
     }
 };
 
@@ -7930,7 +7952,7 @@ protected:
 
     void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map, const std::string prefix = "") override {
         this->prefix         = prefix;
-        enum ggml_type wtype = GGML_TYPE_F16;
+        enum ggml_type wtype = bf16_weights ? GGML_TYPE_BF16 : GGML_TYPE_F16;
         params["weight"]     = ggml_new_tensor_4d(ctx, wtype, kernel_size.second, kernel_size.first, in_channels, out_channels);
         if (bias) {
             enum ggml_type wtype = GGML_TYPE_F32;
@@ -8000,6 +8022,35 @@ public:
         ggml_tensor* b = nullptr;
         if (bias) {
             b = params["bias"];
+        }
+        if (ctx->bf16_compute) {
+            x = bf16_boundary(ctx, x);
+            ggml_tensor* h;
+            if (sd_backend_is(ctx->backend, "CUDA")) {
+                // CUDA direct conv rejects BF16 weights. F32 im2col preserves
+                // BF16 input values without narrowing through FP16; cuBLAS
+                // consumes BF16 weights and accumulates the GEMM in F32.
+                auto cols = ggml_im2col(ctx->ggml_ctx, w, x,
+                    stride.second, stride.first, padding.second, padding.first,
+                    dilation.second, dilation.first, true, GGML_TYPE_F32);
+                auto weights = ggml_reshape_2d(ctx->ggml_ctx, w, cols->ne[0], w->ne[3]);
+                h = ggml_mul_mat(ctx->ggml_ctx, weights, ggml_reshape_2d(ctx->ggml_ctx, cols,
+                    cols->ne[0], cols->ne[1] * cols->ne[2] * cols->ne[3]));
+                ggml_mul_mat_set_prec(h, GGML_PREC_F32);
+                h = ggml_reshape_3d(ctx->ggml_ctx, h, w->ne[3], cols->ne[1] * cols->ne[2], x->ne[3]);
+                h = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, h, 1, 0, 2, 3));
+                h = ggml_reshape_4d(ctx->ggml_ctx, h, cols->ne[1], cols->ne[2], w->ne[3], x->ne[3]);
+                // PyTorch CUDA convolution returns BF16 before its separate
+                // bias addition (unlike the CPU fused-bias convolution).
+                if (b) h = bf16_boundary(ctx, h);
+            } else {
+                // Native CPU direct conv supports BF16 kernels and F32 accumulation.
+                h = ggml_conv_2d_direct(ctx->ggml_ctx, w, x,
+                                        stride.second, stride.first, padding.second, padding.first,
+                                        dilation.second, dilation.first);
+            }
+            if (b) h = ggml_add(ctx->ggml_ctx, h, ggml_reshape_4d(ctx->ggml_ctx, b, 1, 1, b->ne[0], 1));
+            return bf16_boundary(ctx, h);
         }
         const bool use_direct = ctx->conv2d_direct_enabled ||
                                 (ctx->conv2d_auto_direct_enabled && should_use_auto_direct(x, w));
@@ -8190,7 +8241,7 @@ public:
             x->type != output_type) {
             x = ggml_cast(ctx->ggml_ctx, x, output_type);
         }
-        return x;
+        return bf16_boundary(ctx, x);
     }
 };
 
@@ -8286,6 +8337,14 @@ public:
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
         ggml_type output_type = x->type;
+        if (ctx->bf16_compute) {
+            // Qwen/Diffusers RMSNorm: FP32 reduction, BF16 normalized values,
+            // followed by the BF16 affine multiply.
+            auto h = ggml_rms_norm(ctx->ggml_ctx, bf16_boundary(ctx, x), eps);
+            auto w = params["weight"];
+            if (w->type != GGML_TYPE_F32) w = ggml_cast(ctx->ggml_ctx, w, GGML_TYPE_F32);
+            return bf16_boundary(ctx, ggml_mul(ctx->ggml_ctx, bf16_boundary(ctx, h), w));
+        }
         if (output_type != GGML_TYPE_F16 && output_type != GGML_TYPE_BF16 &&
             (model_weight_type == GGML_TYPE_F16 || model_weight_type == GGML_TYPE_BF16)) {
             output_type = model_weight_type;

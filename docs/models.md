@@ -12,6 +12,7 @@ support commitment.
 
 | Model family | Task | HuggingFace base repo | Common format | Backend coverage | Status |
 |---|---|---|---|---|---|
+| [DreamLite-mobile](dreamlite.md) | Text-to-image / single-image editing | DreamLite-mobile (4-step) | Diffusers directory or complete Q4_1/FP16 GGUF | CPU / CUDA | Supported |
 | SD3 / SD3.5 | Text-to-image | [`stabilityai/stable-diffusion-3-medium-diffusers`](https://huggingface.co/stabilityai/stable-diffusion-3-medium-diffusers) (and SD3.5 siblings) | Diffusers-style directory or component weights | CUDA first, CPU/Vulkan functional, Metal experimental | Supported |
 | FLUX.1 | Text-to-image | [`black-forest-labs/FLUX.1-dev`](https://huggingface.co/black-forest-labs/FLUX.1-dev) | Diffusers-style directory, top-level FLUX safetensors, or components | CUDA first, CPU/Vulkan functional, Metal experimental | Supported |
 | FLUX.1-Kontext | Image editing / reference-guided generation | [`black-forest-labs/FLUX.1-Kontext-dev`](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev) | Diffusers-style directory or components | CUDA first, CPU/Vulkan functional, Metal experimental | Supported |
