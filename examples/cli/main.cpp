@@ -162,7 +162,7 @@ static void print_usage(const char* prog) {
         "                            forwards) and write it to <path>\n"
         "  --cache-profile <path>    Load a MagCache ratio table / SenCache sensitivity profile\n"
         "                            from <path> (sencache requires this or --cache-calibrate)\n"
-        "  --backend <name>          Backend: auto, cpu, cuda, vulkan, metal, gpu. Default: auto\n"
+        "  --backend <name>          Backend: auto, cpu, cuda, vulkan, metal, gpu, hiai. Default: auto\n"
         "  --gpu                     Alias for --backend gpu\n"
         "  --devices <csv>           GPU devices for parallel workers, e.g. 0,1,2,3\n"
         "  --type <dtype>            Weight type / on-the-fly quantization when loading safetensors:\n"

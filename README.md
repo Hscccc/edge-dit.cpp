@@ -326,3 +326,7 @@ Technical report citation coming soon. For now, cite the repository:
 edge-dit.cpp is released under the [Apache License 2.0](LICENSE).
 Third-party components and model weights remain under their own licenses; see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [NOTICE](NOTICE).
+
+## Experimental Kirin mobile NPU
+
+See [the HiAI backend guide](docs/mobile/hiai.md) for Android builds, model downloads, mixed execution and current coverage.

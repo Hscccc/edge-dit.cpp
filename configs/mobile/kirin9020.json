@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "device": "PLR-AL30",
+  "soc": "kirin9020",
+  "android_api": 31,
+  "abi": "arm64-v8a",
+  "total_memory_kib": 16021080,
+  "runtime": "/vendor/lib64/libai_single_op.so",
+  "backend": "HIAI0",
+  "storage_quantization": "Q4_0",
+  "execution": "CPU weight decoding followed by HiAI FP16 convolution",
+  "hardware_utilization_trace": "not accessible to adb shell",
+  "cache_limit_mb": 128
+}

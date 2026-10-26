@@ -11,7 +11,15 @@
 #define __STATIC_INLINE__ static inline
 #endif
 
+#if defined(ED_USE_HIAI)
+#include "core/backend/ggml/hiai/ggml-hiai.h"
+#endif
+
 inline void ggml_backend_load_all_once() {
+#if defined(ED_USE_HIAI)
+    static std::once_flag hiai_once;
+    std::call_once(hiai_once, []() { ggml_backend_register(ggml_backend_hiai_reg()); });
+#endif
     // If the registry already has devices and the CPU backend is present,
     // assume either static registration or explicit host-side preloading has
     // completed and avoid rescanning the default paths.

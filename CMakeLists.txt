@@ -41,6 +41,9 @@ set(NCCL_ROOT "" CACHE PATH "Path to NCCL installation")
 set(CUDNN_ROOT "" CACHE PATH "Path to cuDNN installation")
 set(CUDNN_RUNTIME_LIBRARY_DIRS "" CACHE STRING "Extra runtime library directories needed by cuDNN, separated by semicolons")
 
+option(ED_GGML_HIAI "Enable experimental Android Kirin HiAI backend" OFF)
+option(ED_BUILD_MOBILE_TESTS "Build mobile backend integration tests" OFF)
+
 option(ED_GGML_CUDA   "Enable ggml CUDA backend" OFF)
 option(ED_GGML_METAL  "Enable ggml Metal backend" OFF)
 option(ED_GGML_VULKAN "Enable ggml Vulkan backend" OFF)
@@ -325,6 +328,8 @@ file(GLOB_RECURSE ED_CORE_SOURCES CONFIGURE_DEPENDS
     "src/core/*.hpp"
 )
 
+list(FILTER ED_CORE_SOURCES EXCLUDE REGEX ".*/backend/ggml/hiai/.*")
+
 file(GLOB ED_API_SOURCES CONFIGURE_DEPENDS
     "src/*.cpp"
     "src/*.h"
@@ -386,6 +391,26 @@ target_link_libraries(edgedit
     PUBLIC
         ggml
 )
+
+if(ED_GGML_HIAI)
+    if(NOT ANDROID OR NOT ANDROID_ABI STREQUAL "arm64-v8a")
+        message(FATAL_ERROR "ED_GGML_HIAI currently targets Android arm64 Kirin devices")
+    endif()
+    add_library(ed-ggml-hiai STATIC src/core/backend/ggml/hiai/ggml-hiai.cpp)
+    target_include_directories(ed-ggml-hiai PUBLIC src/core/backend/ggml/hiai
+        PRIVATE third_party/ggml/src)
+    target_link_libraries(ed-ggml-hiai PUBLIC ggml ggml-cpu ${CMAKE_DL_LIBS})
+    target_compile_features(ed-ggml-hiai PUBLIC cxx_std_17)
+    target_link_libraries(edgedit PUBLIC ed-ggml-hiai)
+    target_compile_definitions(edgedit PRIVATE ED_USE_HIAI)
+    if(ED_BUILD_MOBILE_TESTS)
+        add_executable(ed-test-hiai tests/mobile/test-hiai.cpp)
+        target_link_libraries(ed-test-hiai PRIVATE ed-ggml-hiai)
+        add_executable(ed-hiai-probe tests/mobile/hiai-probe.cpp)
+        target_include_directories(ed-hiai-probe PRIVATE src/core/backend/ggml/hiai)
+        target_link_libraries(ed-hiai-probe PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+endif()
 
 target_compile_definitions(edgedit
     PRIVATE
